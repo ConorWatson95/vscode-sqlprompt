@@ -1,6 +1,6 @@
-# SQL Prompt for VS Code
+# SQL Prompt CW95 for VS Code
 
-SQL Prompt is a SQL Server IntelliSense and formatting extension for VS Code. It provides schema-aware table completion, configurable alias and procedure-call insertion, wildcard expansion, and a configurable SQL formatter driven by style files, inspired by tools like Redgate SQL Prompt.
+SQL Prompt CW95 is a SQL Server IntelliSense and formatting extension for VS Code. It provides schema-aware table completion, configurable alias and procedure-call insertion, wildcard expansion, and a configurable SQL formatter driven by style files, inspired by tools like Redgate SQL Prompt.
 
 ## What this extension does
 
@@ -75,7 +75,7 @@ To make SQL Prompt the default formatter for SQL files, add this to your `settin
 ```json
 {
   "[sql]": {
-    "editor.defaultFormatter": "watson95.vscode-sqlprompt"
+    "editor.defaultFormatter": "ConorWatson95.vscode-sqlprompt-cw95"
   }
 }
 ```
@@ -147,7 +147,7 @@ If changes do not apply immediately, run `Developer: Reload Window` from the Com
 ```bash
 npm install -g @vscode/vsce
 vsce package
-code --install-extension vscode-sqlprompt-0.1.2.vsix
+code --install-extension vscode-sqlprompt-cw95-0.0.32.vsix
 ```
 
 ## Additional documentation
