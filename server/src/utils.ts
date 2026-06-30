@@ -7,31 +7,20 @@
  *   ARTICOLI         → "a"
  *   Orders           → "o"
  */
-export function generateAlias(tableName: string, existingAliases?: Set<string>): string {
-  let alias: string;
+export interface GenerateAliasOptions {
+  ignoredPrefixes?: string[];
+}
 
-  if (tableName.includes('_')) {
-    alias = tableName
-      .split('_')
-      .map((part) => part.charAt(0).toLowerCase())
-      .join('');
-  } else {
-    // Only use multi-char alias when there's a genuine CamelCase pattern
-    // (mixed case like "OrderDetails"), NOT when the name is entirely uppercase.
-    const isAllUpperOrAllLower =
-      tableName === tableName.toUpperCase() || tableName === tableName.toLowerCase();
-
-    if (!isAllUpperOrAllLower) {
-      const upperLetters = tableName.match(/[A-Z]/g);
-      if (upperLetters && upperLetters.length > 1) {
-        alias = upperLetters.map((l) => l.toLowerCase()).join('');
-      } else {
-        alias = tableName.charAt(0).toLowerCase();
-      }
-    } else {
-      alias = tableName.charAt(0).toLowerCase();
-    }
-  }
+export function generateAlias(
+  tableName: string,
+  existingAliases?: Set<string>,
+  options: GenerateAliasOptions = {},
+): string {
+  const aliasSource = stripIgnoredAliasPrefix(tableName, options.ignoredPrefixes ?? []);
+  const words = splitAliasWords(aliasSource);
+  let alias = words.length > 1
+    ? words.map((part) => part.charAt(0).toLowerCase()).join('')
+    : aliasSource.charAt(0).toLowerCase();
 
   // If existingAliases is provided and this alias is taken, append a counter
   if (existingAliases) {
@@ -44,6 +33,28 @@ export function generateAlias(tableName: string, existingAliases?: Set<string>):
   }
 
   return alias;
+}
+
+function stripIgnoredAliasPrefix(tableName: string, ignoredPrefixes: string[]): string {
+  let result = tableName;
+
+  for (const prefix of ignoredPrefixes) {
+    if (!prefix) continue;
+    if (result.toLowerCase().startsWith(prefix.toLowerCase())) {
+      result = result.slice(prefix.length);
+    }
+  }
+
+  return result || tableName;
+}
+
+function splitAliasWords(tableName: string): string[] {
+  return tableName
+    .split(/[_\s.-]+/)
+    .flatMap((part) =>
+      part.match(/[A-Z]+(?=[A-Z][a-z]|$)|[A-Z]?[a-z]+|\d+/g) ?? [part],
+    )
+    .filter((part) => part.length > 0);
 }
 
 /**

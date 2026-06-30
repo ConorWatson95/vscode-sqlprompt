@@ -1,12 +1,14 @@
 # SQL Prompt for VS Code
 
-SQL Prompt is a SQL Server IntelliSense and formatting extension for VS Code. It provides schema-aware table completion with automatic aliasing and a configurable SQL formatter driven by style files, inspired by tools like Redgate SQL Prompt.
+SQL Prompt is a SQL Server IntelliSense and formatting extension for VS Code. It provides schema-aware table completion, configurable alias and procedure-call insertion, wildcard expansion, and a configurable SQL formatter driven by style files, inspired by tools like Redgate SQL Prompt.
 
 ## What this extension does
 
-- Uses your active ms-mssql connection for the current SQL file
+- Uses your active `ms-mssql` connection for the current SQL file
 - Suggests schema-qualified table names after `FROM` and `JOIN`
-- Inserts automatic aliases, for example `dbo.TABLE_NAME AS tn`
+- Inserts schema-aware table and function completions with configurable aliases
+- Expands `*` and `alias.*` into column lists from the current query
+- Inserts stored procedure calls with configurable named or positional parameters
 - Reloads schema context when you switch to another `.sql` file with a different active connection
 - Formats SQL documents using configurable style files (JSON exports from Redgate SQL Prompt)
 
@@ -21,7 +23,7 @@ Note: `ms-mssql.mssql` is an extension dependency and is installed automatically
 ## First-time setup
 
 1. Open a `.sql` file in VS Code.
-2. Connect to your database using ms-mssql:
+2. Connect to your database using `ms-mssql`:
    - Status bar button, or
    - Command Palette > `MS SQL: Connect`
 3. Wait a moment for SQL Prompt to detect the active connection and load schema metadata.
@@ -40,23 +42,40 @@ Typical suggestions:
 - `dbo.Orders AS o`
 - `dbo.OrderDetails AS od`
 
+Alias and procedure insertion behavior can be customized:
+
+```json
+{
+  "sqlPrompt.completions.insertAsKeyword": false,
+  "sqlPrompt.completions.aliasIgnorePrefixes": ["Bespoke_"],
+  "sqlPrompt.completions.insertNamedProcedureParameters": false,
+  "sqlPrompt.completions.insertSchemaPrefix": false
+}
+```
+
+With those settings:
+
+- `dbo.Bespoke_KPIElement` is inserted as `Bespoke_KPIElement ke`
+- stored procedures are inserted without `@ParamName =`
+- completion labels and inserted text omit the schema prefix
+
 ## SQL Formatter
 
-SQL Prompt includes a document formatter that integrates with VS Code's **Format Document** command (`⇧⌥F`).
+SQL Prompt includes a document formatter that integrates with VS Code's **Format Document** command.
 
 ### Style selection
 
 The active formatting style is shown in the status bar. Click it to open the style picker, or use:
 
 - Command Palette > `SQL Prompt: Select Formatting Style`
-- `SQL Prompt: Format with <Style Name>` — one command per loaded style file, bindable to keyboard shortcuts
+- `SQL Prompt: Format with <Style Name>` - one command per loaded style file, bindable to keyboard shortcuts
 
 To make SQL Prompt the default formatter for SQL files, add this to your `settings.json`:
 
 ```json
 {
   "[sql]": {
-    "editor.defaultFormatter": "borile91.vscode-sqlprompt"
+    "editor.defaultFormatter": "watson95.vscode-sqlprompt"
   }
 }
 ```
@@ -71,9 +90,9 @@ Style files are standard JSON exports from Redgate SQL Prompt. Point the extensi
 }
 ```
 
-The folder is scanned immediately — no reload required. Every `.json` file in that folder is loaded as a named style. The active style is persisted per workspace via `sqlPrompt.formatting.activeStyle`.
+The folder is scanned immediately; no reload required. Every `.json` file in that folder is loaded as a named style. The active style is persisted per workspace via `sqlPrompt.formatting.activeStyle`.
 
-**Example style file** (`MyStyle.json`):
+Example style file (`MyStyle.json`):
 
 ```json
 {
@@ -97,7 +116,7 @@ See [docs/formatting/Defaults.json](docs/formatting/Defaults.json) for the full 
 
 | Command | Description |
 |---|---|
-| `SQL Prompt: Connect to Database` | Opens the ms-mssql connection flow for the current file |
+| `SQL Prompt: Connect to Database` | Opens the `ms-mssql` connection flow for the current file |
 | `SQL Prompt: Disconnect` | Disconnects the SQL Prompt language server |
 | `SQL Prompt: Reload Schema` | Forces a schema reload |
 | `SQL Prompt: Select Formatting Style` | Opens the style picker |
@@ -107,15 +126,19 @@ See [docs/formatting/Defaults.json](docs/formatting/Defaults.json) for the full 
 
 | Setting | Type | Default | Description |
 |---|---|---|---|
-| `sqlPrompt.suppressMssqlIntellisense` | `boolean` | `true` | Suppresses ms-mssql completion suggestions while SQL Prompt is connected |
-| `sqlPrompt.formatting.stylesFolder` | `string` | — | Absolute path to the folder containing `.json` style files |
-| `sqlPrompt.formatting.activeStyle` | `string` | — | Name of the active style (filename without `.json`, or `metadata.name` from the file) |
+| `sqlPrompt.suppressMssqlIntellisense` | `boolean` | `true` | Suppresses `ms-mssql` completion suggestions while SQL Prompt is connected |
+| `sqlPrompt.completions.insertAsKeyword` | `boolean` | `true` | Inserts table aliases with `AS`, for example `dbo.Orders AS o`; set to `false` for `dbo.Orders o` |
+| `sqlPrompt.completions.aliasIgnorePrefixes` | `string[]` | `[]` | Prefixes ignored during alias generation, for example `Bespoke_` makes `Bespoke_KPIElement` alias as `ke` |
+| `sqlPrompt.completions.insertNamedProcedureParameters` | `boolean` | `true` | Inserts stored procedure parameters as named assignments such as `@CustomerId = ...`; set to `false` for positional arguments |
+| `sqlPrompt.completions.insertSchemaPrefix` | `boolean` | `true` | Inserts schema-qualified object names such as `dbo.Orders`; set to `false` to insert only the object name |
+| `sqlPrompt.formatting.stylesFolder` | `string` | empty | Absolute path to the folder containing `.json` style files |
+| `sqlPrompt.formatting.activeStyle` | `string` | empty | Name of the active style (filename without `.json`, or `metadata.name` from the file) |
 
 ## IntelliSense behavior and automatic suppression
 
-SQL Prompt can automatically suppress the ms-mssql extension's IntelliSense so that SQL Prompt completions appear first while you are connected. This suppression only affects completion suggestions — other ms-mssql features (Script As, Alter/Modify Procedure, Execute Query, connection sharing, etc.) remain available.
+SQL Prompt can automatically suppress the `ms-mssql` extension's IntelliSense so that SQL Prompt completions appear first while you are connected. This suppression only affects completion suggestions; other `ms-mssql` features such as Script As, Alter/Modify Procedure, Execute Query, and connection sharing remain available.
 
-Set `sqlPrompt.suppressMssqlIntellisense` to `false` to let both providers coexist (you may see duplicate suggestions).
+Set `sqlPrompt.suppressMssqlIntellisense` to `false` to let both providers coexist, though you may see duplicate suggestions.
 
 If changes do not apply immediately, run `Developer: Reload Window` from the Command Palette.
 
@@ -124,7 +147,7 @@ If changes do not apply immediately, run `Developer: Reload Window` from the Com
 ```bash
 npm install -g @vscode/vsce
 vsce package
-code --install-extension vscode-sqlprompt-0.1.0.vsix
+code --install-extension vscode-sqlprompt-0.1.2.vsix
 ```
 
 ## Additional documentation

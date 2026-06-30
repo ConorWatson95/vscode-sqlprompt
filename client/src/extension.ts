@@ -250,6 +250,12 @@ function normalizeText(value: any): string | undefined {
     return undefined;
 }
 
+function isValidRoutineParameterName(value: unknown): value is string {
+    return typeof value === "string"
+        && value.trim().length > 0
+        && value.trim().toLowerCase() !== "null";
+}
+
 function mapRowsToSchemaSnapshot(rows: any[]): TableInfo[] {
     const tableMap = new Map<string, TableInfo>();
 
@@ -381,7 +387,7 @@ function mapRowsToRoutineSnapshot(rows: any[]): Omit<SchemaSnapshot, "tables"> {
         }
 
         const parameterName = normalizeText(row.parameter_name);
-        if (parameterName) {
+        if (isValidRoutineParameterName(parameterName)) {
             const maxLengthRaw = normalizeCellValue(row.max_length);
             const precisionRaw = normalizeCellValue(row.precision);
             const scaleRaw = normalizeCellValue(row.scale);

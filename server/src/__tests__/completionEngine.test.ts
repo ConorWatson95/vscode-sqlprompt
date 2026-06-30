@@ -4,7 +4,10 @@ import { TextDocument } from 'vscode-languageserver-textdocument';
 import { CompletionItemKind } from 'vscode-languageserver/node';
 
 import { resolveContext } from '../cursorContextResolver.js';
+import { extractStatementAtOffset } from '../documentTextService.js';
 import { buildCompletions, quoteIdentifier } from '../completionEngine.js';
+import type { CompletionSettings } from '../completionEngine.js';
+import { generateAlias } from '../utils.js';
 import type { TableInfo, RoutineSnapshot } from '../schemaLoader.js';
 
 const tables: TableInfo[] = [
@@ -79,10 +82,30 @@ const routines: RoutineSnapshot = {
         },
       ],
     },
+    {
+      schema: 'dbo',
+      name: 'usp_Ping',
+      parameters: [],
+    },
+    {
+      schema: 'dbo',
+      name: 'usp_NullMetadata',
+      parameters: [
+        {
+          name: 'NULL',
+          dataType: 'unknown',
+          maxLength: null,
+          precision: null,
+          scale: null,
+          isOutput: false,
+          hasDefaultValue: false,
+        },
+      ],
+    },
   ],
 };
 
-function getItems(sql: string) {
+function getItems(sql: string, completionSettings?: CompletionSettings) {
   const document = TextDocument.create('file:///test.sql', 'sql', 1, sql);
   const position = document.positionAt(sql.length);
   const context = resolveContext(sql, 0, sql.length, tables);
@@ -94,6 +117,33 @@ function getItems(sql: string) {
     document,
     position,
     { text: sql, start: 0, end: sql.length, cursorOffset: sql.length },
+    [],
+    new Set(),
+    completionSettings,
+  );
+}
+
+function getDocumentItems(sql: string, cursorOffset = sql.length, completionSettings?: CompletionSettings) {
+  const document = TextDocument.create('file:///test.sql', 'sql', 1, sql);
+  const position = document.positionAt(cursorOffset);
+  const statementRange = extractStatementAtOffset(sql, cursorOffset);
+  const context = resolveContext(
+    statementRange.text,
+    statementRange.start,
+    cursorOffset,
+    tables,
+  );
+
+  return buildCompletions(
+    context,
+    tables,
+    routines,
+    document,
+    position,
+    statementRange,
+    [],
+    new Set(),
+    completionSettings,
   );
 }
 
@@ -122,16 +172,79 @@ describe('completionEngine — routines by clause', () => {
 
     assert.ok(tvf, 'Expected table-valued function completion in FROM clause');
     const newText = typeof tvf?.textEdit === 'object' ? (tvf?.textEdit as any).newText : '';
-    assert.match(String(newText), /dbo\.fn_OpenOrders\(\$\{1:0\}\) AS /);
+    assert.ok(String(newText).startsWith('dbo.fn_OpenOrders('));
+    assert.ok(String(newText).includes(' AS '));
   });
 
-  it('FROM proposes views', () => {
+  it('FROM proposes views with AS aliases by default', () => {
     const items = getItems('SELECT * FROM ');
     const view = items.find((i) => i.label === 'dbo.OrderSummaryView');
 
     assert.ok(view, 'Expected view completion in FROM clause');
     const newText = typeof view?.textEdit === 'object' ? (view?.textEdit as any).newText : '';
-    assert.match(String(newText), /dbo\.OrderSummaryView AS /);
+    assert.equal(String(newText), 'dbo.OrderSummaryView AS osv');
+  });
+
+  it('FROM can omit AS aliases when configured', () => {
+    const items = getItems('SELECT * FROM ', {
+      insertAsKeyword: false,
+      aliasIgnorePrefixes: [],
+      insertNamedProcedureParameters: true,
+      insertSchemaPrefix: true,
+    });
+    const view = items.find((i) => i.label === 'dbo.OrderSummaryView');
+
+    assert.ok(view, 'Expected view completion in FROM clause');
+    const newText = typeof view?.textEdit === 'object' ? (view?.textEdit as any).newText : '';
+    assert.equal(String(newText), 'dbo.OrderSummaryView osv');
+  });
+
+  it('DELETE FROM proposes executable aliased delete syntax', () => {
+    const items = getItems('DELETE FROM ');
+    const table = items.find((i) => i.label === 'dbo.Orders');
+
+    assert.ok(table, 'Expected table completion in DELETE FROM clause');
+    const newText = typeof table?.textEdit === 'object' ? (table?.textEdit as any).newText : '';
+    assert.equal(String(newText), 'DELETE o FROM dbo.Orders AS o');
+  });
+
+  it('DELETE FROM respects bare alias configuration', () => {
+    const items = getItems('DELETE FROM ', {
+      insertAsKeyword: false,
+      aliasIgnorePrefixes: [],
+      insertNamedProcedureParameters: true,
+      insertSchemaPrefix: true,
+    });
+    const table = items.find((i) => i.label === 'dbo.Orders');
+
+    assert.ok(table, 'Expected table completion in DELETE FROM clause');
+    const newText = typeof table?.textEdit === 'object' ? (table?.textEdit as any).newText : '';
+    assert.equal(String(newText), 'DELETE o FROM dbo.Orders o');
+  });
+
+  it('DELETE FROM after another statement still inserts the target alias before FROM', () => {
+    const sql = 'SELECT * FROM dbo.OrderSummaryView osv\nDELETE FROM ';
+    const items = getDocumentItems(sql);
+    const table = items.find((i) => i.label === 'dbo.Orders');
+
+    assert.ok(table, 'Expected table completion in DELETE FROM clause');
+    const newText = typeof table?.textEdit === 'object' ? (table?.textEdit as any).newText : '';
+    assert.equal(String(newText), 'DELETE o FROM dbo.Orders AS o');
+  });
+
+  it('WHERE completions only use aliases from the current statement', () => {
+    const sql = [
+      'SELECT * FROM dbo.Orders o',
+      'SELECT * FROM dbo.OrderSummaryView osv WHERE ',
+    ].join('\n');
+    const items = getDocumentItems(sql);
+
+    assert.ok(items.some((i) => i.label === 'osv.OrderId'), 'Expected current statement alias');
+    assert.equal(
+      items.some((i) => i.label === 'o.OrderId'),
+      false,
+      'Previous statement alias should not leak into current WHERE completions',
+    );
   });
 
   it('EXEC proposes stored procedures with named parameter placeholders', () => {
@@ -140,6 +253,123 @@ describe('completionEngine — routines by clause', () => {
 
     assert.ok(proc, 'Expected stored procedure completion in EXEC clause');
     assert.match(String(proc?.insertText), /dbo\.usp_RebuildTotals @CustomerId = \$\{1:0\}/);
+  });
+
+  it('EXEC proposes stored procedures without phantom parameters when none exist', () => {
+    const items = getItems('EXEC ');
+    const proc = items.find((i) => i.label === 'dbo.usp_Ping');
+
+    assert.ok(proc, 'Expected zero-parameter stored procedure completion in EXEC clause');
+    assert.equal(String(proc?.insertText), 'dbo.usp_Ping');
+    assert.doesNotMatch(String(proc?.insertText), /@Null/i);
+  });
+
+  it('EXEC never fabricates parameter assignments from literal NULL metadata', () => {
+    const items = getItems('EXEC ');
+    const proc = items.find((i) => i.label === 'dbo.usp_NullMetadata');
+
+    assert.ok(proc, 'Expected stored procedure completion for NULL-metadata regression case');
+    assert.doesNotMatch(String(proc?.insertText), /@NULL\s*=\s*NULL/i);
+  });
+
+  it('EXEC can insert positional stored procedure parameters when configured', () => {
+    const items = getItems('EXEC ', {
+      insertAsKeyword: true,
+      aliasIgnorePrefixes: [],
+      insertNamedProcedureParameters: false,
+      insertSchemaPrefix: true,
+    });
+    const proc = items.find((i) => i.label === 'dbo.usp_RebuildTotals');
+
+    assert.ok(proc, 'Expected stored procedure completion in EXEC clause');
+    assert.equal(String(proc?.insertText), 'dbo.usp_RebuildTotals ${1:0}');
+    assert.doesNotMatch(String(proc?.insertText), /@CustomerId\s*=/);
+  });
+
+  it('FROM can omit schema prefixes when configured', () => {
+    const items = getItems('SELECT * FROM ', {
+      insertAsKeyword: true,
+      aliasIgnorePrefixes: [],
+      insertNamedProcedureParameters: true,
+      insertSchemaPrefix: false,
+    });
+    const view = items.find((i) => i.label === 'OrderSummaryView');
+
+    assert.ok(view, 'Expected view completion in FROM clause');
+    const newText = typeof view?.textEdit === 'object' ? (view?.textEdit as any).newText : '';
+    assert.equal(String(newText), 'OrderSummaryView AS osv');
+  });
+
+  it('EXEC can omit schema prefixes when configured', () => {
+    const items = getItems('EXEC ', {
+      insertAsKeyword: true,
+      aliasIgnorePrefixes: [],
+      insertNamedProcedureParameters: true,
+      insertSchemaPrefix: false,
+    });
+    const proc = items.find((i) => i.label === 'usp_RebuildTotals');
+
+    assert.ok(proc, 'Expected stored procedure completion in EXEC clause');
+    assert.equal(String(proc?.insertText), 'usp_RebuildTotals @CustomerId = ${1:0}');
+  });
+
+  it('SELECT scalar functions can omit schema prefixes when configured', () => {
+    const items = getItems('SELECT ', {
+      insertAsKeyword: true,
+      aliasIgnorePrefixes: [],
+      insertNamedProcedureParameters: true,
+      insertSchemaPrefix: false,
+    });
+    const scalar = items.find((i) => i.label === 'fn_OrderTotal');
+
+    assert.ok(scalar, 'Expected scalar function completion in SELECT clause');
+    assert.equal(String(scalar?.insertText), 'fn_OrderTotal(${1:0})');
+  });
+
+  it('plain wildcard expansion is offered without an alias prefix', () => {
+    const sql = 'SELECT * FROM dbo.Orders AS o';
+    const cursorOffset = sql.indexOf('*') + 1;
+    const items = getDocumentItems(sql, cursorOffset);
+    const expandItem = items.find((i) => i.label === 'Expand wildcard to columns');
+
+    assert.ok(expandItem, 'Expected wildcard expansion completion for plain *');
+    assert.equal(expandItem?.filterText, '* expand wildcard columns');
+    const newText = typeof expandItem?.textEdit === 'object' ? (expandItem?.textEdit as any).newText : '';
+    assert.equal(String(newText), 'OrderId, CustomerId');
+  });
+
+  it('plain wildcard expansion omits qualifiers for a single auto-aliased table', () => {
+    const sql = 'SELECT * FROM dbo.Orders';
+    const cursorOffset = sql.indexOf('*') + 1;
+    const items = getDocumentItems(sql, cursorOffset);
+    const expandItem = items.find((i) => i.label === 'Expand wildcard to columns');
+
+    assert.ok(expandItem, 'Expected wildcard expansion completion for plain *');
+    const newText = typeof expandItem?.textEdit === 'object' ? (expandItem?.textEdit as any).newText : '';
+    assert.equal(String(newText), 'OrderId, CustomerId');
+  });
+
+  it('plain wildcard expansion keeps qualifiers when multiple tables are visible', () => {
+    const sql = 'SELECT * FROM dbo.Orders o JOIN dbo.OrderSummaryView osv ON o.OrderId = osv.OrderId';
+    const cursorOffset = sql.indexOf('*') + 1;
+    const items = getDocumentItems(sql, cursorOffset);
+    const expandItem = items.find((i) => i.label === 'Expand wildcard to columns');
+
+    assert.ok(expandItem, 'Expected wildcard expansion completion for plain *');
+    const newText = typeof expandItem?.textEdit === 'object' ? (expandItem?.textEdit as any).newText : '';
+    assert.equal(
+      String(newText),
+      'o.OrderId, o.CustomerId, osv.OrderId, osv.CustomerId',
+    );
+  });
+});
+
+describe('generateAlias', () => {
+  it('ignores configured prefixes and treats acronym words as one segment', () => {
+    assert.equal(
+      generateAlias('Bespoke_KPIElement', undefined, { ignoredPrefixes: ['Bespoke_'] }),
+      'ke',
+    );
   });
 });
 

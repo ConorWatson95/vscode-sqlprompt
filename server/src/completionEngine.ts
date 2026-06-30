@@ -8,12 +8,12 @@
  * Entry point: `buildCompletions(context, tables, document, position, statementRange)`
  *
  * Routing:
- *   isAfterDot          → dot-qualified completions (columns or table names)
- *   clause === 'select' → column projections, star expansion
- *   clause === 'from'|'join'  → table / schema completions
- *   clause === 'on'     → FK predicate suggestions
- *   clause === 'where'  → FK predicate + column completions
- *   fallback            → SQL keywords (when in a recognisable SQL context)
+ *   isAfterDot          ? dot-qualified completions (columns or table names)
+ *   clause === 'select' ? column projections, star expansion
+ *   clause === 'from'|'join'  ? table / schema completions
+ *   clause === 'on'     ? FK predicate suggestions
+ *   clause === 'where'  ? FK predicate + column completions
+ *   fallback            ? SQL keywords (when in a recognisable SQL context)
  */
 
 import {
@@ -37,7 +37,21 @@ import {
 import { StatementRange } from './documentTextService';
 import { generateAlias } from './utils';
 
-// ── Snippet completions ───────────────────────────────────────────────────────
+export interface CompletionSettings {
+  insertAsKeyword: boolean;
+  aliasIgnorePrefixes: string[];
+  insertNamedProcedureParameters: boolean;
+  insertSchemaPrefix: boolean;
+}
+
+export const DEFAULT_COMPLETION_SETTINGS: CompletionSettings = {
+  insertAsKeyword: true,
+  aliasIgnorePrefixes: [],
+  insertNamedProcedureParameters: true,
+  insertSchemaPrefix: true,
+};
+
+// -- Snippet completions -------------------------------------------------------
 
 function buildSnippetCompletions(clause: string, position: Position): CompletionItem[] {
   const items: CompletionItem[] = [];
@@ -74,7 +88,7 @@ function buildSnippetCompletions(clause: string, position: Position): Completion
   return items;
 }
 
-// ── Public API ────────────────────────────────────────────────────────────────
+// -- Public API ----------------------------------------------------------------
 
 export function buildCompletions(
   context: QueryContext,
@@ -85,19 +99,39 @@ export function buildCompletions(
   statementRange: StatementRange,
   databases: string[] = [],
   loadingDatabases: ReadonlySet<string> = new Set(),
+  completionSettings: CompletionSettings = DEFAULT_COMPLETION_SETTINGS,
 ): CompletionItem[] {
-  // ── 0. USE <database> completions ────────────────────────────────────────
+  // -- 0. USE <database> completions ----------------------------------------
   if (context.clause === 'use') {
     return buildDatabaseCompletions(databases, document, position);
   }
 
-  // ── 1. Dot-qualified completions ─────────────────────────────────────────
+  const deleteFromContext = isDeleteFromContext(
+    statementRange.text,
+    context.cursorOffset - statementRange.start,
+  );
+
+  // -- 1. Dot-qualified completions -----------------------------------------
   if (context.isAfterDot && context.qualifierChain?.length) {
-    return buildDotCompletions(context, tables, routines, position, databases, loadingDatabases);
+    return buildDotCompletions(
+      context,
+      tables,
+      routines,
+      document,
+      position,
+      statementRange,
+      databases,
+      loadingDatabases,
+      deleteFromContext,
+      completionSettings,
+    );
   }
 
   const items: CompletionItem[] = [];
-  const refs = resolveRefs(context.visibleSources, tables);
+  const refs = resolveRefs(context.visibleSources, tables, completionSettings);
+  const effectiveClause = deleteFromContext
+    ? 'from'
+    : context.clause;
   const lineText = document.getText({
     start: { line: position.line, character: 0 },
     end: position,
@@ -107,8 +141,8 @@ export function buildCompletions(
     items.push(...buildFunctionParameterCompletions(context, routines));
   }
 
-  // ── 2. Star expansion (highest priority in SELECT) ───────────────────────
-  if (context.clause === 'select' && (refs.length || context.visibleSources.length)) {
+  // -- 2. Star expansion (highest priority in SELECT) -----------------------
+  if (context.statementKind === 'select' && (refs.length || context.visibleSources.length)) {
     const starItems = buildStarExpansionCompletions(
       context,
       refs,
@@ -118,32 +152,26 @@ export function buildCompletions(
     if (starItems.length) return starItems;
   }
 
-  // ── 3. Clause-specific completions ──────────────────────────────────────
-  switch (context.clause) {
+  // -- 3. Clause-specific completions --------------------------------------
+  switch (effectiveClause) {
     case 'select':
       items.push(...buildSnippetCompletions('select', position));
       items.push(...buildColumnCompletionsForRefs(refs, true, false));
       items.push(...buildColumnCompletionsForSources(context.visibleSources));
-      items.push(...buildScalarFunctionCompletions(routines.scalarFunctions));
+      items.push(...buildScalarFunctionCompletions(routines.scalarFunctions, completionSettings));
       // Always offer an "expand all columns" item when there are visible sources
       items.push(...buildExpandAllColumnsItem(context, refs, document, statementRange, position));
       break;
 
     case 'from':
     case 'join': {
-      // Build the set of aliases already committed in the current query so that
-      // new suggestions get a deduplicated alias (e.g. o2 when o is taken).
-      const usedAliases = new Set(
-        context.visibleSources
-          .map((s) => s.alias)
-          .filter((a): a is string => a !== undefined),
-      );
-
+      const usedAliases = getUsedAliases(context);
       items.push(...buildSnippetCompletions(context.clause, position));
       const schemaMatch = SCHEMA_DOT_PATTERN.exec(lineText);
       if (schemaMatch) {
         const dbName = schemaMatch[1]?.toLowerCase();   // undefined when no db qualifier
         const schemaName = schemaMatch[2];
+        const qualifiedPrefix = schemaMatch[1] ? `${schemaMatch[1]}.${schemaName}` : schemaName;
         const replaceRange = replaceRangeWordOnly(lineText, position);
         tables
           .filter(
@@ -152,14 +180,26 @@ export function buildCompletions(
               (dbName === undefined || (t.database ?? '').toLowerCase() === dbName),
           )
           .forEach((table) => {
-            // Pass a copy so that sibling items don't affect each other.
-            const alias = generateAlias(table.name, new Set(usedAliases));
+            const alias = generateAlias(table.name, new Set(usedAliases), {
+              ignoredPrefixes: completionSettings.aliasIgnorePrefixes,
+            });
+            const insertion = buildSourceCompletionEdit(
+              context,
+              document,
+              position,
+              statementRange,
+              `${qualifiedPrefix}.${quoteIdentifier(table.name)}`,
+              `${quoteIdentifier(table.name)}${aliasSuffix(alias, completionSettings)}`,
+              alias,
+              deleteFromContext,
+              completionSettings,
+            );
             items.push({
               label: table.name,
               kind: CompletionItemKind.Class,
-              detail: `Table — alias: ${alias}`,
+              detail: `Table (${table.schema})`,
               filterText: table.name,
-              textEdit: TextEdit.replace(replaceRange, `${table.name} AS ${alias}`),
+              textEdit: insertion.textEdit ?? TextEdit.replace(replaceRange, insertion.newText),
               insertTextFormat: InsertTextFormat.PlainText,
               sortText: `01_table_${table.name}`,
               data: { type: 'table', index: tables.indexOf(table) },
@@ -169,15 +209,18 @@ export function buildCompletions(
         routines.tableValuedFunctions
           .filter((fn) => fn.schema.toLowerCase() === schemaName.toLowerCase())
           .forEach((fn) => {
-            const alias = generateAlias(fn.name, new Set(usedAliases));
+            const alias = generateAlias(fn.name, new Set(usedAliases), {
+              ignoredPrefixes: completionSettings.aliasIgnorePrefixes,
+            });
+            const functionText = buildFunctionCallText(fn.name, fn.parameters);
             items.push({
               label: fn.name,
               kind: CompletionItemKind.Function,
-              detail: `Table-valued function — alias: ${alias}`,
+              detail: 'Table-valued function',
               filterText: fn.name,
               textEdit: TextEdit.replace(
                 replaceRange,
-                `${buildFunctionCallText(fn.name, fn.parameters)} AS ${alias}`,
+                `${functionText}${aliasSuffix(alias, completionSettings)}`,
               ),
               insertTextFormat: InsertTextFormat.Snippet,
               sortText: `02_tvf_${fn.name}`,
@@ -186,14 +229,32 @@ export function buildCompletions(
       } else {
         const replaceRange = replaceRangeWordOnly(lineText, position);
         tables.forEach((table, idx) => {
-          const alias = generateAlias(table.name, new Set(usedAliases));
           const fullName = `${table.schema}.${table.name}`;
+          const insertedTableName = formatQualifiedObjectName(
+            table.schema,
+            table.name,
+            completionSettings,
+          );
+          const alias = generateAlias(table.name, new Set(usedAliases), {
+            ignoredPrefixes: completionSettings.aliasIgnorePrefixes,
+          });
+          const insertion = buildSourceCompletionEdit(
+            context,
+            document,
+            position,
+            statementRange,
+            insertedTableName,
+            `${insertedTableName}${aliasSuffix(alias, completionSettings)}`,
+            alias,
+            deleteFromContext,
+            completionSettings,
+          );
           items.push({
-            label: fullName,
+            label: formatObjectLabel(table.schema, table.name, completionSettings),
             kind: CompletionItemKind.Class,
-            detail: `Table (${table.schema}) — alias: ${alias}`,
+            detail: `Table (${table.schema})`,
             filterText: fullName,
-            textEdit: TextEdit.replace(replaceRange, `${fullName} AS ${alias}`),
+            textEdit: insertion.textEdit ?? TextEdit.replace(replaceRange, insertion.newText),
             insertTextFormat: InsertTextFormat.PlainText,
             sortText: `01_table_${table.name}`,
             data: { type: 'table', index: idx },
@@ -201,16 +262,23 @@ export function buildCompletions(
         });
 
         routines.tableValuedFunctions.forEach((fn) => {
-          const alias = generateAlias(fn.name, new Set(usedAliases));
           const fullName = `${fn.schema}.${fn.name}`;
+          const insertedFunctionName = formatQualifiedObjectName(
+            fn.schema,
+            fn.name,
+            completionSettings,
+          );
+          const alias = generateAlias(fn.name, new Set(usedAliases), {
+            ignoredPrefixes: completionSettings.aliasIgnorePrefixes,
+          });
           items.push({
-            label: fullName,
+            label: formatObjectLabel(fn.schema, fn.name, completionSettings),
             kind: CompletionItemKind.Function,
-            detail: `Table-valued function (${fn.schema}) — alias: ${alias}`,
+            detail: 'Table-valued function',
             filterText: fullName,
             textEdit: TextEdit.replace(
               replaceRange,
-              `${buildFunctionCallText(fullName, fn.parameters)} AS ${alias}`,
+              `${buildFunctionCallText(insertedFunctionName, fn.parameters)}${aliasSuffix(alias, completionSettings)}`,
             ),
             insertTextFormat: InsertTextFormat.Snippet,
             sortText: `02_tvf_${fn.name}`,
@@ -219,13 +287,26 @@ export function buildCompletions(
 
         // Add all defined CTEs to FROM/JOIN suggestions
         context.visibleCtes.forEach((cteName, cteIdx) => {
-          const alias = generateAlias(cteName, new Set(usedAliases));
+          const alias = generateAlias(cteName, new Set(usedAliases), {
+            ignoredPrefixes: completionSettings.aliasIgnorePrefixes,
+          });
+          const insertion = buildSourceCompletionEdit(
+            context,
+            document,
+            position,
+            statementRange,
+            cteName,
+            `${cteName}${aliasSuffix(alias, completionSettings)}`,
+            alias,
+            deleteFromContext,
+            completionSettings,
+          );
           items.push({
             label: cteName,
             kind: CompletionItemKind.Variable,
-            detail: `CTE — alias: ${alias}`,
+            detail: 'CTE',
             filterText: cteName,
-            textEdit: TextEdit.replace(replaceRange, `${cteName} AS ${alias}`),
+            textEdit: insertion.textEdit ?? TextEdit.replace(replaceRange, insertion.newText),
             insertTextFormat: InsertTextFormat.PlainText,
             sortText: `01_cte_${cteIdx.toString().padStart(3, '0')}`,
           });
@@ -244,16 +325,10 @@ export function buildCompletions(
           });
         });
       }
-
-      // After a JOIN + table ref, suggest "ON fk.predicate"
-      if (context.clause === 'join' && refs.length >= 2) {
-        items.push(...buildJoinOnClauseCompletions(refs, position, new Set()));
-      }
       break;
     }
-
     case 'exec':
-      items.push(...buildStoredProcedureCompletions(routines.storedProcedures));
+      items.push(...buildStoredProcedureCompletions(routines.storedProcedures, completionSettings));
       break;
 
     case 'on': {
@@ -271,7 +346,7 @@ export function buildCompletions(
       items.push(...buildWherePredicateCompletions(refs, position));
       items.push(...buildColumnCompletionsForRefs(refs, true, false));
       items.push(...buildColumnCompletionsForSources(context.visibleSources));
-      items.push(...buildScalarFunctionCompletions(routines.scalarFunctions));
+      items.push(...buildScalarFunctionCompletions(routines.scalarFunctions, completionSettings));
       break;
     }
 
@@ -280,7 +355,7 @@ export function buildCompletions(
     case 'orderBy':
       items.push(...buildColumnCompletionsForRefs(refs, true, false));
       items.push(...buildColumnCompletionsForSources(context.visibleSources));
-      items.push(...buildScalarFunctionCompletions(routines.scalarFunctions));
+      items.push(...buildScalarFunctionCompletions(routines.scalarFunctions, completionSettings));
       break;
 
     case 'updateSet':
@@ -315,17 +390,22 @@ export function buildCompletions(
       if (context.statementKind !== 'unknown') {
         items.push(...buildSqlKeywordCompletions(position));
         if (context.statementKind === 'exec') {
-          items.push(...buildStoredProcedureCompletions(routines.storedProcedures));
+          items.push(...buildStoredProcedureCompletions(routines.storedProcedures, completionSettings));
         }
         if (tables.length > 0) {
           tables.forEach((table, idx) => {
             const fullName = `${table.schema}.${table.name}`;
+            const insertedTableName = formatQualifiedObjectName(
+              table.schema,
+              table.name,
+              completionSettings,
+            );
             items.push({
-              label: fullName,
+              label: formatObjectLabel(table.schema, table.name, completionSettings),
               kind: CompletionItemKind.Class,
               detail: `Table (${table.columns.length} columns)`,
               filterText: fullName,
-              insertText: fullName,
+              insertText: insertedTableName,
               insertTextFormat: InsertTextFormat.PlainText,
               sortText: `01_table_${table.name}`,
               data: { type: 'table', index: idx },
@@ -360,22 +440,27 @@ export function resolveTableCompletionItem(item: CompletionItem, tables: TableIn
   return item;
 }
 
-// ── Dot completions ───────────────────────────────────────────────────────────
+// -- Dot completions -----------------------------------------------------------
 
 function buildDotCompletions(
   context: QueryContext,
   tables: TableInfo[],
   routines: RoutineSnapshot,
+  document: TextDocument,
   position: Position,
+  statementRange: StatementRange,
   databases: string[] = [],
   loadingDatabases: ReadonlySet<string> = new Set(),
+  deleteFromContext: boolean = false,
+  completionSettings: CompletionSettings = DEFAULT_COMPLETION_SETTINGS,
 ): CompletionItem[] {
   const chain = context.qualifierChain!;
   const qualifier = chain[chain.length - 1]; // last part before the dot
   const replaceRange = Range.create(position, position);
   const qualifierLower = qualifier.toLowerCase();
+  const usedAliases = getUsedAliases(context);
 
-  // ── [db.]schema. chain: when chain length ≥ 2, restrict to the database
+  // -- [db.]schema. chain: when chain length = 2, restrict to the database
   // named by the penultimate qualifier.  e.g. chain = ["DBA", "dbo"] means
   // the user is typing after "DBA.dbo." — show tables in DBA.dbo only.
   const dbFilter =
@@ -410,7 +495,7 @@ function buildDotCompletions(
           character: Math.max(0, position.character - qualifier.length - 1),
         };
         items.push({
-          label: `★ Expand ${qualifier}.*`,
+          label: `? Expand ${qualifier}.*`,
           kind: CompletionItemKind.Snippet,
           detail: `Expands all ${matchingSource.columns.length} column(s)`,
           insertText: expansion,
@@ -469,19 +554,29 @@ function buildDotCompletions(
       : [];
 
   if (schemaMatches.length || schemaRoutineMatches.length || schemaProcedureMatches.length) {
-    const usedAliases = new Set(
-      context.visibleSources
-        .map((s) => s.alias)
-        .filter((a): a is string => a !== undefined),
-    );
     const tableItems = schemaMatches.map((table) => {
-      const alias = generateAlias(table.name, new Set(usedAliases));
+      const alias = generateAlias(table.name, new Set(usedAliases), {
+        ignoredPrefixes: completionSettings.aliasIgnorePrefixes,
+      });
+      const tableName = quoteIdentifier(table.name);
+      const qualifiedPrefix = chain.join('.');
+      const insertion = buildSourceCompletionEdit(
+        context,
+        document,
+        position,
+        statementRange,
+        `${qualifiedPrefix}.${tableName}`,
+        `${tableName}${aliasSuffix(alias, completionSettings)}`,
+        alias,
+        deleteFromContext,
+        completionSettings,
+      );
       return {
         label: table.name,
         kind: CompletionItemKind.Class,
-        detail: `Table (${table.schema}) — alias: ${alias}`,
+        detail: `Table (${table.schema})`,
         filterText: table.name,
-        textEdit: TextEdit.replace(replaceRange, `${quoteIdentifier(table.name)} AS ${alias}`),
+        textEdit: insertion.textEdit ?? TextEdit.replace(replaceRange, insertion.newText),
         insertTextFormat: InsertTextFormat.PlainText,
         sortText: `01_table_${table.name}`,
         data: { type: 'table', index: tables.indexOf(table) },
@@ -489,15 +584,17 @@ function buildDotCompletions(
     });
 
     const tvfItems = schemaRoutineMatches.map((fn) => {
-      const alias = generateAlias(fn.name, new Set(usedAliases));
+      const alias = generateAlias(fn.name, new Set(usedAliases), {
+        ignoredPrefixes: completionSettings.aliasIgnorePrefixes,
+      });
       return {
         label: fn.name,
         kind: CompletionItemKind.Function,
-        detail: `Table-valued function (${fn.schema}) — alias: ${alias}`,
+        detail: 'Table-valued function',
         filterText: `${fn.name} ${fn.schema}.${fn.name}`,
         textEdit: TextEdit.replace(
           replaceRange,
-          `${buildFunctionCallText(quoteIdentifier(fn.name), fn.parameters)} AS ${alias}`,
+          `${buildFunctionCallText(quoteIdentifier(fn.name), fn.parameters)}${aliasSuffix(alias, completionSettings)}`,
         ),
         insertTextFormat: InsertTextFormat.Snippet,
         sortText: `02_tvf_${fn.name}`,
@@ -511,16 +608,20 @@ function buildDotCompletions(
       filterText: `${proc.name} ${proc.schema}.${proc.name}`,
       textEdit: TextEdit.replace(
         replaceRange,
-        buildProcedureCallText(quoteIdentifier(proc.name), proc.parameters),
+        buildProcedureCallText(
+          quoteIdentifier(proc.name),
+          proc.parameters,
+          completionSettings,
+        ),
       ),
       insertTextFormat: InsertTextFormat.Snippet,
-      sortText: `02_proc_${proc.name}`,
+      sortText: `03_proc_${proc.schema}_${proc.name}`,
     }));
 
     return [...tableItems, ...tvfItems, ...procedureItems];
   }
 
-  // Is it a table name? → offer columns
+  // Is it a table name? Offer columns.
   const tableMatch = tables.find((t) => t.name.toLowerCase() === qualifier.toLowerCase());
   if (tableMatch) {
     return tableMatch.columns.map((col) => ({
@@ -534,24 +635,22 @@ function buildDotCompletions(
     }));
   }
 
-  // Is it a database name? (chain length 1 only — for "DBA." → show schemas)
+  // Is it a database name? (chain length 1 only: for "DBA." show schemas)
   if (chain.length === 1) {
     const isKnownDatabase =
       databases.some((d) => d.toLowerCase() === qualifierLower) ||
       tables.some((t) => (t.database ?? '').toLowerCase() === qualifierLower);
 
     if (isKnownDatabase) {
-      // If the schema is still loading, show a placeholder item.
       if (loadingDatabases.has(qualifierLower)) {
         return [
           {
-            label: `Loading schema for ${qualifier}…`,
+            label: `Loading schema for ${qualifier}...`,
             kind: CompletionItemKind.Event,
-            detail: 'Please wait — schema is being loaded',
+            detail: 'Please wait: schema is being loaded',
             insertText: '',
             insertTextFormat: InsertTextFormat.PlainText,
             sortText: '00_loading',
-            // Prevent accidental insertion
             textEdit: TextEdit.replace(Range.create(position, position), ''),
           },
         ];
@@ -560,7 +659,6 @@ function buildDotCompletions(
       const tablesForDb = tables.filter(
         (t) => (t.database ?? '').toLowerCase() === qualifierLower,
       );
-
       const schemasForDb = [...new Set(tablesForDb.map((t) => t.schema))].sort();
 
       const schemaItems = schemasForDb.map((schema) => ({
@@ -574,20 +672,28 @@ function buildDotCompletions(
         sortText: `01_schema_${schema}`,
       }));
 
-      const usedAliases = new Set(
-        context.visibleSources
-          .map((s) => s.alias)
-          .filter((a): a is string => a !== undefined),
-      );
       const tableItems = tablesForDb.map((table) => {
-        const alias = generateAlias(table.name, new Set(usedAliases));
-        const fullName = `${table.schema}.${table.name}`;
+        const alias = generateAlias(table.name, new Set(usedAliases), {
+          ignoredPrefixes: completionSettings.aliasIgnorePrefixes,
+        });
+        const fullName = `${table.schema}.${quoteIdentifier(table.name)}`;
+        const insertion = buildSourceCompletionEdit(
+          context,
+          document,
+          position,
+        statementRange,
+        `${qualifier}.${fullName}`,
+        `${fullName}${aliasSuffix(alias, completionSettings)}`,
+        alias,
+        deleteFromContext,
+        completionSettings,
+      );
         return {
-          label: fullName,
+          label: `${table.schema}.${table.name}`,
           kind: CompletionItemKind.Class,
-          detail: `Table (${table.schema}) — alias: ${alias}`,
-          filterText: fullName,
-          textEdit: TextEdit.replace(replaceRange, `${fullName} AS ${alias}`),
+          detail: `Table (${table.schema})`,
+          filterText: `${table.schema}.${table.name}`,
+          textEdit: insertion.textEdit ?? TextEdit.replace(replaceRange, insertion.newText),
           insertTextFormat: InsertTextFormat.PlainText,
           sortText: `02_table_${table.schema}_${table.name}`,
         };
@@ -600,12 +706,6 @@ function buildDotCompletions(
   return [];
 }
 
-// ── Star expansion ────────────────────────────────────────────────────────────
-
-/**
- * Expands `*` or `alias.*` into the explicit column list.
- * Returns an empty array when the star pattern is not detected.
- */
 function buildStarExpansionCompletions(
   context: QueryContext,
   refs: ResolvedRef[],
@@ -639,7 +739,7 @@ function buildStarExpansionCompletions(
       replacement = ref.table.columns
         .map((c) => normalizeColumnName((c as any)?.name ?? c))
         .filter((name): name is string => Boolean(name))
-        .map((name) => `${ref.alias}.${name}`)
+        .map((name) => `${qualifierForRef(ref)}.${name}`)
         .join(', ');
     } else {
       // Fall back to CTE / unresolved visible sources
@@ -657,12 +757,13 @@ function buildStarExpansionCompletions(
       }
     }
   } else {
+    const shouldQualify = shouldQualifyExpandedColumns(refs, context.visibleSources);
     // Combine resolved table refs and CTE/unresolved sources
     const refCols = refs.flatMap((ref) =>
       ref.table.columns
         .map((c) => normalizeColumnName((c as any)?.name ?? c))
         .filter((name): name is string => Boolean(name))
-        .map((name) => `${ref.alias}.${name}`),
+        .map((name) => shouldQualify ? `${qualifierForRef(ref)}.${name}` : name),
     );
     const cteCols = context.visibleSources
       .filter((s) => !s.schema && s.columns?.length)
@@ -670,7 +771,7 @@ function buildStarExpansionCompletions(
         (s.columns ?? [])
           .map((c) => normalizeColumnName(c))
           .filter((name): name is string => Boolean(name))
-          .map((name) => `${s.alias ?? s.objectName}.${name}`),
+          .map((name) => shouldQualify ? `${s.alias ?? s.objectName}.${name}` : name),
       );
     replacement = [...refCols, ...cteCols].join(', ');
   }
@@ -686,6 +787,7 @@ function buildStarExpansionCompletions(
       kind: CompletionItemKind.Snippet,
       detail: 'Expand * using tables in current query',
       documentation: { kind: 'markdown', value: `Inserts: \`${replacement}\`` },
+      filterText: '* expand wildcard columns',
       preselect: true,
       textEdit: TextEdit.replace(
         Range.create(startPos.line, startPos.character, endPos.line, endPos.character),
@@ -697,7 +799,7 @@ function buildStarExpansionCompletions(
   ];
 }
 
-// ── Expand all columns (explicit item, always available in SELECT) ─────────
+// -- Expand all columns (explicit item, always available in SELECT) ---------
 
 /**
  * Provides a single completion item that, when accepted, inserts ALL columns
@@ -711,11 +813,12 @@ function buildExpandAllColumnsItem(
   statementRange: StatementRange,
   position: Position,
 ): CompletionItem[] {
+  const shouldQualify = shouldQualifyExpandedColumns(refs, context.visibleSources);
   const refCols = refs.flatMap((ref) =>
     ref.table.columns
       .map((c) => normalizeColumnName((c as any)?.name ?? c))
       .filter((name): name is string => Boolean(name))
-      .map((name) => `${ref.alias}.${name}`),
+      .map((name) => shouldQualify ? `${qualifierForRef(ref)}.${name}` : name),
   );
   const cteCols = context.visibleSources
     .filter((s) => !s.schema && s.columns?.length)
@@ -723,7 +826,7 @@ function buildExpandAllColumnsItem(
       (s.columns ?? [])
         .map((c) => normalizeColumnName(c))
         .filter((name): name is string => Boolean(name))
-        .map((name) => `${s.alias ?? s.objectName}.${name}`),
+        .map((name) => shouldQualify ? `${s.alias ?? s.objectName}.${name}` : name),
     );
 
   const allCols = [...refCols, ...cteCols];
@@ -733,7 +836,7 @@ function buildExpandAllColumnsItem(
   const replaceRange = Range.create(position, position);
 
   return [{
-    label: '★ Expand all columns',
+    label: '? Expand all columns',
     kind: CompletionItemKind.Snippet,
     detail: `Inserts ${allCols.length} column(s) from all visible tables`,
     documentation: { kind: 'markdown', value: `\`\`\`sql\n${replacement}\n\`\`\`` },
@@ -744,7 +847,7 @@ function buildExpandAllColumnsItem(
   }];
 }
 
-// ── Column completions ────────────────────────────────────────────────────────
+// -- Column completions --------------------------------------------------------
 
 function buildColumnCompletionsForRefs(
   refs: ResolvedRef[],
@@ -757,7 +860,7 @@ function buildColumnCompletionsForRefs(
       if (!colName) return [];
 
       // Use table name instead of alias if the alias was auto-generated
-      const qualifier = ref.isAutoAlias ? ref.table.name : ref.alias;
+      const qualifier = qualifierForRef(ref);
       const insertValue = includeAlias ? `${qualifier}.${colName}` : colName;
       const label = aliasAlreadyTyped ? colName : `${qualifier}.${colName}`;
 
@@ -774,7 +877,7 @@ function buildColumnCompletionsForRefs(
   );
 }
 
-// ── CTE / unresolved-source column completions ────────────────────────────────
+// -- CTE / unresolved-source column completions --------------------------------
 
 /**
  * Builds column completions for VisibleSources that have no backing schema
@@ -831,7 +934,7 @@ export function quoteIdentifier(name: string): string {
   return `[${name}]`;
 }
 
-// ── Routine completions ──────────────────────────────────────────────────────
+// -- Routine completions ------------------------------------------------------
 
 function buildFunctionCallText(functionName: string, parameters: RoutineParameterInfo[]): string {
   if (parameters.length === 0) return `${functionName}()`;
@@ -887,15 +990,23 @@ function buildFunctionParameterCompletions(
 function buildProcedureCallText(
   procedureName: string,
   parameters: RoutineParameterInfo[],
+  settings: CompletionSettings = DEFAULT_COMPLETION_SETTINGS,
 ): string {
-  if (parameters.length === 0) return procedureName;
+  const validParameters = parameters.filter((parameter) => isValidRoutineParameterName(parameter.name));
+  if (validParameters.length === 0) return procedureName;
 
-  const args = parameters
+  const args = validParameters
     .map((p, idx) => {
-      const cleanName = normalizeParameterName(p.name);
       const defaultValue = defaultValueForParameter(p);
       const outputSuffix = p.isOutput ? ' OUTPUT' : '';
-      return `${cleanName} = ` + '${' + (idx + 1) + ':' + defaultValue + '}' + outputSuffix;
+      const snippet = '${' + (idx + 1) + ':' + defaultValue + '}' + outputSuffix;
+
+      if (!settings.insertNamedProcedureParameters) {
+        return snippet;
+      }
+
+      const cleanName = normalizeParameterName(p.name);
+      return `${cleanName} = ${snippet}`;
     })
     .join(', ');
 
@@ -904,6 +1015,12 @@ function buildProcedureCallText(
 
 function normalizeParameterName(name: string): string {
   return name.startsWith('@') ? name : `@${name}`;
+}
+
+function isValidRoutineParameterName(name: unknown): name is string {
+  return typeof name === 'string'
+    && name.trim().length > 0
+    && name.trim().toLowerCase() !== 'null';
 }
 
 function defaultValueForParameter(parameter: RoutineParameterInfo): string {
@@ -937,41 +1054,61 @@ const TIME_TYPES = new Set(['time']);
 const DATETIME_TYPES = new Set(['datetime', 'smalldatetime', 'datetime2', 'datetimeoffset']);
 const BINARY_TYPES = new Set(['binary', 'varbinary', 'image', 'rowversion', 'timestamp']);
 
-function buildScalarFunctionCompletions(functions: ScalarFunctionInfo[]): CompletionItem[] {
+function buildScalarFunctionCompletions(
+  functions: ScalarFunctionInfo[],
+  settings: CompletionSettings = DEFAULT_COMPLETION_SETTINGS,
+): CompletionItem[] {
   return functions.map((fn) => {
     const fullName = `${fn.schema}.${fn.name}`;
+    const insertedFunctionName = formatQualifiedObjectName(
+      fn.schema,
+      fn.name,
+      settings,
+    );
     return {
-      label: fullName,
+      label: formatObjectLabel(fn.schema, fn.name, settings),
       kind: CompletionItemKind.Function,
       detail: 'Scalar function',
       filterText: `${fn.name} ${fullName}`,
-      insertText: buildFunctionCallText(fullName, fn.parameters),
+      insertText: buildFunctionCallText(insertedFunctionName, fn.parameters),
       insertTextFormat: InsertTextFormat.Snippet,
       sortText: `03_scalar_${fn.schema}_${fn.name}`,
     };
   });
 }
 
-function buildStoredProcedureCompletions(procedures: StoredProcedureInfo[]): CompletionItem[] {
+function buildStoredProcedureCompletions(
+  procedures: StoredProcedureInfo[],
+  settings: CompletionSettings = DEFAULT_COMPLETION_SETTINGS,
+): CompletionItem[] {
   return procedures.map((proc) => {
     const fullName = `${proc.schema}.${proc.name}`;
-    const quotedFullName = `${quoteIdentifier(proc.schema)}.${quoteIdentifier(proc.name)}`;
-    const paramList = proc.parameters.length > 0
-      ? ` (${proc.parameters.map((p) => normalizeParameterName(p.name)).join(', ')})`
+    const insertedProcedureName = formatQualifiedObjectName(
+      proc.schema,
+      proc.name,
+      settings,
+    );
+    const validParameters = proc.parameters.filter((parameter) => isValidRoutineParameterName(parameter.name));
+    const paramList = validParameters.length > 0
+      ? ` (${validParameters.map((p) => normalizeParameterName(p.name)).join(', ')})`
       : '';
     return {
-      label: fullName,
+      label: formatObjectLabel(proc.schema, proc.name, settings),
       kind: CompletionItemKind.Method,
       detail: `Stored procedure${paramList}`,
       filterText: `${proc.name} ${fullName}`,
-      insertText: buildProcedureCallText(quotedFullName, proc.parameters),
+      insertText: buildProcedureCallText(
+        insertedProcedureName,
+        proc.parameters,
+        settings,
+      ),
       insertTextFormat: InsertTextFormat.Snippet,
       sortText: `03_proc_${proc.schema}_${proc.name}`,
     };
   });
 }
 
-// ── FK predicate completions ──────────────────────────────────────────────────
+// -- FK predicate completions --------------------------------------------------
 
 type PredicateSuggestion = {
   label: string;
@@ -1004,7 +1141,7 @@ function buildFkPredicateSuggestions(
       (m) => `${fromRef.alias}.${m.column} = ${toRef.alias}.${m.referencedColumn}`,
     );
     const previews = fkMappings.map(
-      (m) => `${fromRef.alias}.${m.column} → ${toRef.alias}.${m.referencedColumn}`,
+      (m) => `${fromRef.alias}.${m.column} ? ${toRef.alias}.${m.referencedColumn}`,
     );
     const combined = singles.join(' AND ');
     const combinedPreview = previews.join(' AND ');
@@ -1013,7 +1150,7 @@ function buildFkPredicateSuggestions(
     if (includeCombined && !seen.has(combined) && !excludePredicates.has(normalised(combined))) {
       seen.add(combined);
       suggestions.push({
-        label: `${fromRef.alias} → ${toRef.alias} (ALL)`,
+        label: `${fromRef.alias} ? ${toRef.alias} (ALL)`,
         insertText: combined,
         preview: combinedPreview,
         detail: `FK ${fkName}`,
@@ -1036,7 +1173,7 @@ function buildFkPredicateSuggestions(
   }
 
   for (const prevRef of previousRefs) {
-    // FK from joinRef → prevRef
+    // FK from joinRef ? prevRef
     for (const fk of joinRef.table.foreignKeys ?? []) {
       if (
         fk.referencedSchema.toLowerCase() === prevRef.table.schema.toLowerCase() &&
@@ -1046,7 +1183,7 @@ function buildFkPredicateSuggestions(
         addSuggestions(joinRef, prevRef, fk.mappings, fk.name);
       }
     }
-    // FK from prevRef → joinRef
+    // FK from prevRef ? joinRef
     for (const fk of prevRef.table.foreignKeys ?? []) {
       if (
         fk.referencedSchema.toLowerCase() === joinRef.table.schema.toLowerCase() &&
@@ -1120,7 +1257,7 @@ function buildWherePredicateCompletions(refs: ResolvedRef[], position: Position)
   }));
 }
 
-// ── Keyword completions ───────────────────────────────────────────────────────
+// -- Keyword completions -------------------------------------------------------
 
 const SQL_KEYWORDS_LIST = [
   'SELECT', 'FROM', 'JOIN', 'INNER JOIN', 'LEFT JOIN', 'RIGHT JOIN',
@@ -1144,7 +1281,77 @@ function buildSqlKeywordCompletions(position: Position): CompletionItem[] {
   }));
 }
 
-// ── Helper: resolve VisibleSource[] → ResolvedRef[] ──────────────────────────
+function isDeleteFromContext(statementText: string, cursorOffset: number): boolean {
+  const beforeCursor = statementText.slice(0, cursorOffset);
+  return /\bDELETE\s+FROM\b/i.test(beforeCursor);
+}
+
+function aliasSuffix(alias: string, settings: CompletionSettings): string {
+  return settings.insertAsKeyword ? ` AS ${alias}` : ` ${alias}`;
+}
+
+function formatQualifiedObjectName(
+  schema: string,
+  objectName: string,
+  settings: CompletionSettings,
+): string {
+  const quotedObjectName = quoteIdentifier(objectName);
+  if (!settings.insertSchemaPrefix) {
+    return quotedObjectName;
+  }
+
+  return `${quoteIdentifier(schema)}.${quotedObjectName}`;
+}
+
+function formatObjectLabel(
+  schema: string,
+  objectName: string,
+  settings: CompletionSettings,
+): string {
+  return settings.insertSchemaPrefix ? `${schema}.${objectName}` : objectName;
+}
+
+function buildSourceCompletionEdit(
+  context: QueryContext,
+  document: TextDocument,
+  position: Position,
+  statementRange: StatementRange,
+  deleteTableExpression: string,
+  normalNewText: string,
+  alias: string,
+  deleteFromContext: boolean,
+  settings: CompletionSettings,
+): { newText: string; textEdit?: TextEdit } {
+  if (context.statementKind !== 'delete' || !deleteFromContext) {
+    return { newText: normalNewText };
+  }
+
+  const cursorRelative = context.cursorOffset - statementRange.start;
+  const beforeCursor = statementRange.text.slice(0, cursorRelative);
+  const isInitialDeleteFrom = /^\s*DELETE\s+FROM\s+[\w[\]."]*$/i.test(beforeCursor);
+  if (!isInitialDeleteFrom) {
+    return { newText: normalNewText };
+  }
+
+  const leadingWhitespace = beforeCursor.match(/^\s*/)?.[0] ?? '';
+  const replacement = `${leadingWhitespace}DELETE ${alias} FROM ${deleteTableExpression}${aliasSuffix(alias, settings)}`;
+  const range = Range.create(document.positionAt(statementRange.start), position);
+
+  return {
+    newText: replacement,
+    textEdit: TextEdit.replace(range, replacement),
+  };
+}
+
+function getUsedAliases(context: QueryContext): Set<string> {
+  return new Set(
+    context.visibleSources
+      .map((source) => source.alias)
+      .filter((alias): alias is string => alias !== undefined),
+  );
+}
+
+// -- Helper: resolve VisibleSource[] ? ResolvedRef[] --------------------------
 
 /**
  * Maps visible sources back to their full `TableInfo` (needed for FK logic).
@@ -1152,7 +1359,23 @@ function buildSqlKeywordCompletions(position: Position): CompletionItem[] {
  */
 type ResolvedRef = { table: TableInfo; alias: string; isAutoAlias: boolean };
 
-function resolveRefs(sources: VisibleSource[], tables: TableInfo[]): ResolvedRef[] {
+function qualifierForRef(ref: ResolvedRef): string {
+  return ref.isAutoAlias ? ref.table.name : ref.alias;
+}
+
+function shouldQualifyExpandedColumns(
+  refs: ResolvedRef[],
+  visibleSources: VisibleSource[],
+): boolean {
+  const unresolvedSources = visibleSources.filter((source) => !source.schema && source.columns?.length);
+  return refs.length + unresolvedSources.length > 1;
+}
+
+function resolveRefs(
+  sources: VisibleSource[],
+  tables: TableInfo[],
+  completionSettings: CompletionSettings = DEFAULT_COMPLETION_SETTINGS,
+): ResolvedRef[] {
   const result: ResolvedRef[] = [];
   for (const s of sources) {
     if (!s.schema) continue; // CTE or unresolved
@@ -1169,7 +1392,9 @@ function resolveRefs(sources: VisibleSource[], tables: TableInfo[]): ResolvedRef
     if (table) {
       result.push({
         table,
-        alias: s.alias ?? generateAlias(table.name),
+        alias: s.alias ?? generateAlias(table.name, undefined, {
+          ignoredPrefixes: completionSettings.aliasIgnorePrefixes,
+        }),
         isAutoAlias: !(s.explicitAlias ?? false),
       });
     }
@@ -1177,7 +1402,7 @@ function resolveRefs(sources: VisibleSource[], tables: TableInfo[]): ResolvedRef
   return result;
 }
 
-// ── Helper: extract already-used ON predicates ────────────────────────────────
+// -- Helper: extract already-used ON predicates --------------------------------
 
 /**
  * Collects the predicates already written in the ON clause so they can be
@@ -1215,7 +1440,7 @@ function extractUsedOnPredicates(statementText: string, cursorOffset: number): S
   return new Set(chunks);
 }
 
-// ── Helpers: replace range computation ───────────────────────────────────────
+// -- Helpers: replace range computation ---------------------------------------
 
 /**
  * Computes the Range to replace when a table/column completion is accepted.

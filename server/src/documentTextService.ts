@@ -83,6 +83,7 @@ export function findStatementBoundaries(text: string): number[] {
   const boundaries: number[] = [0];
   const len = text.length;
   let i = 0;
+  let parenDepth = 0;
 
   while (i < len) {
     const ch = text[i];
@@ -138,6 +139,18 @@ export function findStatementBoundaries(text: string): number[] {
     }
 
     // ── Semicolon terminator ─────────────────────────────────────────────
+    if (ch === '(') {
+      parenDepth++;
+      i++;
+      continue;
+    }
+
+    if (ch === ')') {
+      if (parenDepth > 0) parenDepth--;
+      i++;
+      continue;
+    }
+
     if (ch === ';') {
       boundaries.push(i + 1);
       i++;
@@ -165,10 +178,65 @@ export function findStatementBoundaries(text: string): number[] {
       }
     }
 
+    if (
+      i > 0 &&
+      parenDepth === 0 &&
+      isAtLineStatementStart(text, i) &&
+      isStatementStartKeyword(text, i) &&
+      !followsGotoLabel(text, i)
+    ) {
+      boundaries.push(i);
+      i++;
+      continue;
+    }
+
     i++;
   }
 
   return boundaries;
+}
+
+function isAtLineStatementStart(text: string, index: number): boolean {
+  let lineStart = index;
+  while (lineStart > 0 && text[lineStart - 1] !== '\n' && text[lineStart - 1] !== '\r') {
+    lineStart--;
+  }
+
+  return text.slice(lineStart, index).trim().length === 0;
+}
+
+function isStatementStartKeyword(text: string, index: number): boolean {
+  const match = /^(SELECT|WITH|INSERT|UPDATE|DELETE|MERGE|EXEC|EXECUTE)\b/i.exec(text.slice(index));
+  if (!match) return false;
+
+  if (match[1].toUpperCase() === 'SELECT') {
+    let previous = index - 1;
+    while (previous >= 0 && /\s/.test(text[previous])) previous--;
+    if (previous >= 0 && text[previous] === ')') return false;
+  }
+
+  return true;
+}
+
+function followsGotoLabel(text: string, index: number): boolean {
+  const currentLineStart = findLineStart(text, index);
+  let prevLineEnd = currentLineStart - 1;
+  while (prevLineEnd >= 0 && (text[prevLineEnd] === '\n' || text[prevLineEnd] === '\r')) {
+    prevLineEnd--;
+  }
+  if (prevLineEnd < 0) return false;
+
+  const prevLineStart = findLineStart(text, prevLineEnd);
+  const prevLine = text.slice(prevLineStart, prevLineEnd + 1).trim();
+  return /^GOTO\b/i.test(prevLine);
+}
+
+function findLineStart(text: string, index: number): number {
+  let lineStart = index;
+  while (lineStart > 0 && text[lineStart - 1] !== '\n' && text[lineStart - 1] !== '\r') {
+    lineStart--;
+  }
+  return lineStart;
 }
 
 /** Returns true when the two characters at `i` form a valid GO separator. */

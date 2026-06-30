@@ -21,7 +21,12 @@ import {
 } from "./schemaLoader";
 import { extractStatementAtOffset } from "./documentTextService";
 import { resolveContext } from "./cursorContextResolver";
-import { buildCompletions, resolveTableCompletionItem } from "./completionEngine";
+import {
+  buildCompletions,
+  CompletionSettings,
+  DEFAULT_COMPLETION_SETTINGS,
+  resolveTableCompletionItem,
+} from "./completionEngine";
 
 const connection = createConnection(ProposedFeatures.all);
 const documents: TextDocuments<TextDocument> = new TextDocuments(TextDocument);
@@ -31,6 +36,7 @@ let tables: TableInfo[] = [];
 let routines: RoutineSnapshot = emptyRoutineSnapshot();
 let databases: string[] = [];
 let hasConfigurationCapability = false;
+let completionSettings: CompletionSettings = DEFAULT_COMPLETION_SETTINGS;
 
 /** Lowercase database names whose schema has already been loaded (or attempted). */
 const loadedDatabaseNames = new Set<string>();
@@ -103,6 +109,47 @@ connection.onInitialize((params: InitializeParams) => {
 
   return result;
 });
+
+connection.onInitialized(() => {
+  void refreshCompletionSettings();
+});
+
+connection.onDidChangeConfiguration(() => {
+  void refreshCompletionSettings();
+});
+
+async function refreshCompletionSettings(): Promise<void> {
+  if (!hasConfigurationCapability) {
+    completionSettings = DEFAULT_COMPLETION_SETTINGS;
+    return;
+  }
+
+  const settings = await connection.workspace.getConfiguration({
+    section: "sqlPrompt.completions",
+  });
+  completionSettings = normalizeCompletionSettings(settings);
+}
+
+function normalizeCompletionSettings(settings: unknown): CompletionSettings {
+  const raw = settings && typeof settings === 'object'
+    ? settings as Record<string, unknown>
+    : {};
+
+  return {
+    insertAsKeyword: typeof raw.insertAsKeyword === 'boolean'
+      ? raw.insertAsKeyword
+      : DEFAULT_COMPLETION_SETTINGS.insertAsKeyword,
+    aliasIgnorePrefixes: Array.isArray(raw.aliasIgnorePrefixes)
+      ? raw.aliasIgnorePrefixes.filter((value): value is string => typeof value === 'string')
+      : DEFAULT_COMPLETION_SETTINGS.aliasIgnorePrefixes,
+    insertNamedProcedureParameters: typeof raw.insertNamedProcedureParameters === 'boolean'
+      ? raw.insertNamedProcedureParameters
+      : DEFAULT_COMPLETION_SETTINGS.insertNamedProcedureParameters,
+    insertSchemaPrefix: typeof raw.insertSchemaPrefix === 'boolean'
+      ? raw.insertSchemaPrefix
+      : DEFAULT_COMPLETION_SETTINGS.insertSchemaPrefix,
+  };
+}
 
 
 
@@ -466,7 +513,17 @@ connection.onCompletion(
       }
     }
 
-    return buildCompletions(context, tables, routines, document, position, statementRange, databases, loadingDatabaseNames);
+    return buildCompletions(
+      context,
+      tables,
+      routines,
+      document,
+      position,
+      statementRange,
+      databases,
+      loadingDatabaseNames,
+      completionSettings,
+    );
   },
 );
 
@@ -563,7 +620,7 @@ function sanitizeRoutineParameters(raw: unknown): RoutineParameterInfo[] {
     .map((param) => {
       const p = param as Record<string, unknown>;
       const name = unwrapCellValue(p?.name);
-      if (!name) return null;
+      if (!name || name.trim().toLowerCase() === 'null') return null;
 
       return {
         name,

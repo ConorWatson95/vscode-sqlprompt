@@ -74,6 +74,12 @@ export interface RoutineSnapshot {
     storedProcedures: StoredProcedureInfo[];
 }
 
+function isValidRoutineParameterName(value: unknown): value is string {
+    return typeof value === 'string'
+        && value.trim().length > 0
+        && value.trim().toLowerCase() !== 'null';
+}
+
 export class SchemaLoader {
     private pool: sql.ConnectionPool | null = null;
     private config: ConnectionConfig | null;
@@ -321,7 +327,7 @@ export class SchemaLoader {
                 });
             }
 
-            if (row.parameter_name) {
+            if (isValidRoutineParameterName(row.parameter_name)) {
                 routineMap.get(key)!.parameters.push({
                     name: row.parameter_name,
                     dataType: row.data_type ?? 'unknown',

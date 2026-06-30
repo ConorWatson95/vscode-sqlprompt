@@ -54,6 +54,18 @@ describe('findStatementBoundaries — GO separator', () => {
     const bounds = findStatementBoundaries(text);
     assert.equal(bounds.length, 1);
   });
+
+  it('splits common statement starts on new lines without semicolons', () => {
+    const text = 'SELECT * FROM dbo.Orders o\nDELETE FROM dbo.OrderSummaryView';
+    const bounds = findStatementBoundaries(text);
+    assert.deepEqual(bounds, [0, text.indexOf('DELETE')]);
+  });
+
+  it('does not split line-start SELECT inside parentheses', () => {
+    const text = 'WITH cte AS (\nSELECT * FROM dbo.Orders\n)\nSELECT * FROM cte';
+    const bounds = findStatementBoundaries(text);
+    assert.deepEqual(bounds, [0]);
+  });
 });
 
 // ── extractStatementAtOffset ──────────────────────────────────────────────────
@@ -106,5 +118,13 @@ describe('extractStatementAtOffset', () => {
     const result = extractStatementAtOffset(text, secondBatchOffset + 3);
     assert.ok(result.text.includes('SELECT 2'), `Expected "SELECT 2", got "${result.text}"`);
     assert.ok(!result.text.includes('SELECT 1'));
+  });
+
+  it('returns only the current newline-started statement when semicolons are omitted', () => {
+    const text = 'SELECT * FROM dbo.Orders o\nDELETE FROM dbo.OrderSummaryView';
+    const deleteOffset = text.indexOf('DELETE') + 3;
+    const result = extractStatementAtOffset(text, deleteOffset);
+    assert.ok(result.text.startsWith('DELETE'), `Expected DELETE statement, got "${result.text}"`);
+    assert.ok(!result.text.includes('Orders o'), 'Should not include previous SELECT statement');
   });
 });

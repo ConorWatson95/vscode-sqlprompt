@@ -1,12 +1,17 @@
 {
-    "name": "vscode-sqlprompt",
+    "name": "vscode-sqlprompt-cw95",
     "displayName": "SQL Prompt",
-    "description": "SQL Server IntelliSense - schema-aware autocomplete like Redgate SQL Prompt",
-    "version": "0.1.17",
-    "publisher": "borile91",
+    "description": "SQL Server IntelliSense and formatting for VS Code with configurable aliases, procedure completions, and wildcard expansion.",
+    "version": "0.0.32",
+    "publisher": "ConorWatson95",
+    "license": "MIT",
     "repository": {
         "type": "git",
-        "url": "https://github.com/borile91/vscode-sqlprompt.git"
+        "url": "https://github.com/ConorWatson95/vscode-sqlprompt.git"
+    },
+    "homepage": "https://github.com/ConorWatson95/vscode-sqlprompt",
+    "bugs": {
+        "url": "https://github.com/ConorWatson95/vscode-sqlprompt/issues"
     },
     "engines": {
         "vscode": "^1.75.0"
@@ -55,6 +60,33 @@
                     "type": "boolean",
                     "default": true,
                     "description": "When connected, automatically disable the mssql extension's IntelliSense so that SQL Prompt completions appear exclusively. Connection features (Script As, Alter Procedure, etc.) are unaffected. Set to false to let both providers coexist."
+                },
+                "sqlPrompt.completions.insertAsKeyword": {
+                    "scope": "resource",
+                    "type": "boolean",
+                    "default": true,
+                    "description": "When enabled, table completions include aliases using the AS keyword, for example dbo.Orders AS o. Disable to insert bare aliases such as dbo.Orders o."
+                },
+                "sqlPrompt.completions.aliasIgnorePrefixes": {
+                    "scope": "resource",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "default": [],
+                    "description": "Table-name prefixes to ignore when generating aliases. For example, Bespoke_KPIElement with Bespoke_ ignored becomes ke."
+                },
+                "sqlPrompt.completions.insertNamedProcedureParameters": {
+                    "scope": "resource",
+                    "type": "boolean",
+                    "default": true,
+                    "description": "When enabled, stored procedure completions insert named parameters such as @CustomerId = ${1:0}. Disable to insert positional arguments only."
+                },
+                "sqlPrompt.completions.insertSchemaPrefix": {
+                    "scope": "resource",
+                    "type": "boolean",
+                    "default": true,
+                    "description": "When enabled, object completions insert schema-qualified names such as dbo.Orders or dbo.usp_RebuildTotals. Disable to insert only the object name."
                 },
                 "sqlPrompt.formatting.stylesFolder": {
                     "scope": "resource",
