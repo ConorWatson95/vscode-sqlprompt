@@ -1,6 +1,6 @@
 {
     "name": "vscode-sqlprompt-cw95",
-    "displayName": "SQL Prompt",
+    "displayName": "SQL Prompt CW95",
     "description": "SQL Server IntelliSense and formatting for VS Code with configurable aliases, procedure completions, and wildcard expansion.",
     "version": "0.0.32",
     "publisher": "ConorWatson95",
